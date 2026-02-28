@@ -147,7 +147,21 @@ def handle_postback(event):
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = (event.message.text or "").strip()
+    # ====== 最高優先：回傳 user_id（用來登記老師/家長） ======
+    if text in ["老師報到", "ID", "id", "我的ID", "我的 id", "我的Id"]:
+        uid = getattr(event.source, "user_id", None)
+        if not uid:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="⚠️ 目前拿不到你的 user_id。請用手機 LINE 與官方帳號一對一聊天，再輸入「老師報到」。")
+            )
+            return
 
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"✅ 你的 LINE user_id（teacher_line_id）如下：\n{uid}")
+        )
+        return
     # 聯絡教室
     if text == "聯絡教室":
         line_bot_api.reply_message(
@@ -228,3 +242,4 @@ def handle_message(event):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+
