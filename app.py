@@ -157,6 +157,7 @@ def get_teacher_students_by_weekday(teacher_line_id: str, weekday: int) -> list:
             continue
         if tid == teacher_line_id and wd == weekday:
             out.append(name)
+    # uniq keep order
     seen = set()
     uniq = []
     for s in out:
@@ -174,8 +175,7 @@ def filter_students_by_keyword(students: list, keyword: str) -> list:
 # ====== Postback data helpers ======
 def parse_qs(data: str) -> dict:
     out = {}
-    parts = data.split("&")
-    for p in parts:
+    for p in (data or "").split("&"):
         if "=" in p:
             k, v = p.split("=", 1)
             out[k] = v
@@ -187,7 +187,7 @@ def enc(s: str) -> str:
 def dec(s: str) -> str:
     return unquote(s)
 
-# ====== Flex builders ======
+# ====== Flex builders (全部 postback，不刷聊天室文字指令) ======
 def flex_weekday_picker_card(today_wd: int):
     btns = [{
         "type": "button", "height": "sm", "style": "primary",
@@ -212,9 +212,11 @@ def flex_weekday_picker_card(today_wd: int):
         }
     )
 
-def flex_student_list_card(uid: str, wd: int, students_all: list, keyword: str = None):
+def flex_student_list_card(wd: int, students_all: list, keyword: str = None):
+    # 前 12 + 搜尋
     show_search = len(students_all) > 12
     students = students_all[:12]
+
     buttons = []
     for name in students:
         buttons.append({
@@ -226,9 +228,18 @@ def flex_student_list_card(uid: str, wd: int, students_all: list, keyword: str =
             "type": "button", "height": "sm", "style": "secondary",
             "action": {"type": "postback", "label": "🔍 搜尋", "data": f"cmd=enter_search&wd={wd}"}
         })
+
     title = f"{weekday_label(wd)}｜選學生"
     if keyword:
         title = f"{weekday_label(wd)}｜搜尋：{keyword}"
+
+    # 若完全沒學生：仍給「改星期」回去
+    if not buttons:
+        buttons = [{
+            "type": "button", "height": "sm", "style": "secondary",
+            "action": {"type": "postback", "label": "改星期", "data": "cmd=back_to_day"}
+        }]
+
     return FlexSendMessage(
         alt_text="點名-選學生",
         contents={
@@ -237,6 +248,7 @@ def flex_student_list_card(uid: str, wd: int, students_all: list, keyword: str =
                 "type": "box", "layout": "vertical", "spacing": "md",
                 "contents": [
                     {"type": "text", "text": title, "weight": "bold", "size": "lg"},
+                    {"type": "text", "text": "點選學生 → 選堂數", "size": "sm", "color": "#666666"},
                     {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "md", "contents": buttons}
                 ]
             }
@@ -253,6 +265,11 @@ def flex_lesson_card(wd: int, name: str):
             "action": {"type": "postback", "label": opt,
                        "data": f"cmd=pick_lesson&wd={wd}&name={enc(name)}&lesson={enc(opt)}"}
         })
+    # 返回清單
+    btns.append({
+        "type": "button", "height": "sm", "style": "secondary",
+        "action": {"type": "postback", "label": "返回學生清單", "data": f"cmd=pick_day&wd={wd}"}
+    })
     return FlexSendMessage(
         alt_text="點名-選堂數",
         contents={
@@ -261,6 +278,7 @@ def flex_lesson_card(wd: int, name: str):
                 "type": "box", "layout": "vertical", "spacing": "md",
                 "contents": [
                     {"type": "text", "text": name, "weight": "bold", "size": "lg"},
+                    {"type": "text", "text": "選擇本次堂數", "size": "sm", "color": "#666666"},
                     {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "md", "contents": btns}
                 ]
             }
@@ -268,6 +286,7 @@ def flex_lesson_card(wd: int, name: str):
     )
 
 def flex_done_card(wd: int, msg: str):
+    # ✅ 只保留：繼續 / 改星期 / 搜尋（沒有「結束點名」）
     return FlexSendMessage(
         alt_text="點名-完成",
         contents={
@@ -286,9 +305,6 @@ def flex_done_card(wd: int, msg: str):
                         {"type": "button", "height": "sm", "style": "secondary",
                          "action": {"type": "postback", "label": "🔍 搜尋",
                                     "data": f"cmd=enter_search&wd={wd}"}},
-                        {"type": "button", "height": "sm", "style": "secondary",
-                         "action": {"type": "postback", "label": "✅ 結束點名",
-                                    "data": "cmd=end_attendance"}},
                     ]}
                 ]
             }
@@ -309,12 +325,13 @@ def webhook():
 # ====== Postback handler ======
 @handler.add(PostbackEvent)
 def handle_postback(event):
-    data = event.postback.data or ""
+    data = (event.postback.data or "").strip()
     uid = getattr(event.source, "user_id", None)
 
     def reply(msg):
         line_bot_api.reply_message(event.reply_token, msg)
 
+    # Rich Menu：點名
     if data == "action=attendance":
         if not uid or not is_teacher(uid):
             reply(TextSendMessage(text="此功能僅限老師使用。"))
@@ -322,95 +339,157 @@ def handle_postback(event):
         reply(flex_weekday_picker_card(weekday_today_1to7()))
         return
 
+    # Rich Menu：紀錄
     if data == "action=records":
-        reply(TextSendMessage(text="紀錄功能未變"))
+        if not uid or not is_teacher(uid):
+            reply(TextSendMessage(text="此功能僅限老師使用。"))
+            return
+
+        # 最近 5 筆（該老師）
+        rows = ws_log.get_all_values()
+        hits = []
+        for row in reversed(rows[1:]):
+            if len(row) < 6:
+                continue
+            if (row[1] or "").strip() == uid:
+                hits.append(row)
+            if len(hits) >= 5:
+                break
+
+        if not hits:
+            reply(TextSendMessage(text="📒 目前沒有紀錄。"))
+            return
+
+        lines = []
+        for r in hits:
+            ts = (r[0] or "").strip()
+            name = (r[2] or "").strip()
+            classes = (r[3] or "").strip()
+            status = (r[4] or "").strip()
+            remain = (r[5] or "").strip()
+            if status == "請假":
+                lines.append(f"{ts}  {name}  請假  剩{remain}")
+            else:
+                lines.append(f"{ts}  {name}  -{classes}  剩{remain}")
+
+        reply(TextSendMessage(text="📒 最近紀錄（5筆）\n" + "\n".join(lines)))
         return
 
+    # 其他 postback：全部限定老師
     if not uid or not is_teacher(uid):
         reply(TextSendMessage(text="此功能僅限老師使用。"))
         return
 
     qs = parse_qs(data)
-    cmd = qs.get("cmd")
-
-    if cmd == "end_attendance":
-        state_clear(uid)
-        return  # 🔥 完全靜音，不回訊息
+    cmd = qs.get("cmd", "")
 
     if cmd == "back_to_day":
         reply(flex_weekday_picker_card(weekday_today_1to7()))
         return
 
     if cmd == "pick_day":
-        wd = int(qs.get("wd", weekday_today_1to7()))
+        try:
+            wd = int(qs.get("wd", weekday_today_1to7()))
+        except:
+            wd = weekday_today_1to7()
         students = get_teacher_students_by_weekday(uid, wd)
-        reply(flex_student_list_card(uid, wd, students))
+        reply(flex_student_list_card(wd, students))
         return
 
     if cmd == "enter_search":
-        wd = int(qs.get("wd", weekday_today_1to7()))
+        try:
+            wd = int(qs.get("wd", weekday_today_1to7()))
+        except:
+            wd = weekday_today_1to7()
         state_set_search(uid, wd)
-        reply(TextSendMessage(text=f"{weekday_label(wd)}：請輸入「搜尋:關鍵字」"))
+        reply(TextSendMessage(text=f"{weekday_label(wd)}：請輸入「搜尋:關鍵字」（例：搜尋:王）"))
         return
 
     if cmd == "pick_student":
-        wd = int(qs.get("wd", weekday_today_1to7()))
+        try:
+            wd = int(qs.get("wd", weekday_today_1to7()))
+        except:
+            wd = weekday_today_1to7()
         name = dec(qs.get("name", ""))
+        if not name:
+            reply(TextSendMessage(text="⚠️ 找不到學生名稱，請回上一頁重試。"))
+            return
         reply(flex_lesson_card(wd, name))
         return
 
     if cmd == "pick_lesson":
-        wd = int(qs.get("wd", weekday_today_1to7()))
+        try:
+            wd = int(qs.get("wd", weekday_today_1to7()))
+        except:
+            wd = weekday_today_1to7()
         name = dec(qs.get("name", ""))
         lesson = dec(qs.get("lesson", ""))
 
-        if lesson == "請假":
-            remaining = get_remaining(name)
-            append_log(uid, name, "", "請假", remaining)
-            reply(flex_done_card(wd, f"✅ {name} 請假｜剩 {remaining}"))
+        if not name or not lesson:
+            reply(TextSendMessage(text="⚠️ 資訊不足，請回上一頁重試。"))
             return
 
-        used = float(lesson)
-        before = get_remaining(name)
-        after = round(before - used, 2)
+        try:
+            if lesson == "請假":
+                remaining = get_remaining(name)
+                append_log(uid, name, "", "請假", remaining)
+                state_clear(uid)
+                reply(flex_done_card(wd, f"✅ {name} 請假｜剩 {remaining}"))
+                return
 
-        if after < 0:
-            reply(flex_done_card(wd, f"⚠️ {name} 剩餘不足（現有 {before}）"))
+            used = float(lesson)
+            before = get_remaining(name)
+            after = round(before - used, 2)
+
+            if after < 0:
+                reply(flex_done_card(wd, f"⚠️ {name} 剩餘不足（現有 {before}，本次扣 {used}）"))
+                return
+
+            set_remaining(name, after)
+            append_log(uid, name, lesson, "上課", after)
+            state_clear(uid)
+            reply(flex_done_card(wd, f"✅ {name} -{lesson}｜剩 {after}"))
             return
 
-        set_remaining(name, after)
-        append_log(uid, name, lesson, "上課", after)
-        reply(flex_done_card(wd, f"✅ {name} -{lesson}｜剩 {after}"))
-        return
+        except Exception as e:
+            reply(TextSendMessage(text=f"⚠️ 扣堂失敗：{e}"))
+            return
 
-# ====== Message handler (ID / contact / search input) ======
+    reply(TextSendMessage(text=f"收到操作：{data}"))
+
+# ====== Message handler（只保留 ID / 搜尋 / 其他提示） ======
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = (event.message.text or "").strip()
     uid = getattr(event.source, "user_id", None)
 
-    if text in ["老師報到", "ID", "id"]:
-        reply = line_bot_api.reply_message
-        reply(event.reply_token, TextSendMessage(text=f"你的 user_id：{uid}"))
+    if text in ["老師報到", "ID", "id", "我的ID", "我的 id", "我的Id"]:
+        if not uid:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 目前拿不到你的 user_id。"))
+            return
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 你的 user_id：{uid}"))
         return
 
-    if text == "聯絡教室":
-        line_bot_api.reply_message(event.reply_token,
-                                   TextSendMessage(text="禾禾音樂教室\n電話：0978-136-812"))
-        return
+    if text.startswith("搜尋:"):
+        if not uid or not is_teacher(uid):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="此功能僅限老師使用。"))
+            return
 
-    if text.startswith("搜尋:") and uid and is_teacher(uid):
         st = state_get(uid)
         wd = st["wd"] if st else weekday_today_1to7()
-        keyword = text.split(":", 1)[1]
+        keyword = text.split(":", 1)[1].strip()
+
         students = get_teacher_students_by_weekday(uid, wd)
         matches = filter_students_by_keyword(students, keyword)
-        line_bot_api.reply_message(event.reply_token,
-                                   flex_student_list_card(uid, wd, matches, keyword=keyword))
+
+        if not matches:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"找不到符合「{keyword}」的學生（{weekday_label(wd)}）。"))
+            return
+
+        line_bot_api.reply_message(event.reply_token, flex_student_list_card(wd, matches, keyword=keyword))
         return
 
-    line_bot_api.reply_message(event.reply_token,
-                               TextSendMessage(text="請使用選單操作"))
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請使用選單（點名 / 紀錄）"))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
