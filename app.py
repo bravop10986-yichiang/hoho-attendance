@@ -12,7 +12,8 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage,
     PostbackEvent,
-    QuickReply, QuickReplyButton, MessageAction
+    QuickReply, QuickReplyButton, MessageAction,
+    FlexSendMessage
 )
 
 app = Flask(__name__)
@@ -50,15 +51,15 @@ def now_taipei_str():
     return datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
 
 def weekday_today_1to7():
-    # Mon=1 .. Sun=7
+    # Mon=1..Sun=7
     return datetime.now(TZ_TAIPEI).isoweekday()
 
 def weekday_label(wd: int) -> str:
     labels = {1: "週一", 2: "週二", 3: "週三", 4: "週四", 5: "週五", 6: "週六", 7: "週日"}
     return labels.get(wd, f"週{wd}")
 
-# ====== Simple in-memory session (Render 建議 workers=1) ======
-PENDING = {}  # user_id -> {"stage": "...", "weekday": int|None, "ts": int, "keyword": str|None}
+# ====== Simple in-memory state (Render 建議 workers=1) ======
+PENDING = {}  # uid -> {"stage": "searching", "weekday": int, "ts": int}
 PENDING_TIMEOUT_SEC = 10 * 60
 
 def _now_ts():
@@ -73,13 +74,13 @@ def pending_get(uid: str):
         return None
     return st
 
-def pending_set(uid: str, stage: str, weekday: int = None, keyword: str = None):
-    PENDING[uid] = {"stage": stage, "weekday": weekday, "keyword": keyword, "ts": _now_ts()}
+def pending_set(uid: str, stage: str, weekday: int):
+    PENDING[uid] = {"stage": stage, "weekday": weekday, "ts": _now_ts()}
 
 def pending_clear(uid: str):
     PENDING.pop(uid, None)
 
-# ====== Cache teachers (avoid reading sheet every message) ======
+# ====== Cache teachers ======
 TEACHERS_CACHE = {"ts": 0, "ids": set()}
 TEACHERS_CACHE_TTL_SEC = 30
 
@@ -87,7 +88,7 @@ def refresh_teachers_cache(force=False):
     now = _now_ts()
     if (not force) and (now - TEACHERS_CACHE["ts"] < TEACHERS_CACHE_TTL_SEC):
         return
-    rows = ws_teachers.get_all_values()  # header + rows
+    rows = ws_teachers.get_all_values()
     ids = set()
     for i, row in enumerate(rows):
         if i == 0:
@@ -103,7 +104,7 @@ def is_teacher(uid: str) -> bool:
     refresh_teachers_cache()
     return uid in TEACHERS_CACHE["ids"]
 
-# ====== Utility (students) ======
+# ====== students utils ======
 def find_student_row(student_name: str):
     names = ws_students.col_values(1)  # A欄：student_name
     for idx, n in enumerate(names[1:], start=2):
@@ -139,7 +140,7 @@ def append_log(teacher_line_id: str, student_name: str, classes: str, status: st
         remaining_after
     ], value_input_option="USER_ENTERED")
 
-# ====== teacher_students (filter by weekday) ======
+# ====== teacher_students utils ======
 def get_teacher_students_by_weekday(teacher_line_id: str, weekday: int) -> list:
     """
     teacher_students:
@@ -165,6 +166,7 @@ def get_teacher_students_by_weekday(teacher_line_id: str, weekday: int) -> list:
             continue
         if tid == teacher_line_id and wd == weekday:
             out.append(name)
+
     # uniq keep order
     seen = set()
     uniq = []
@@ -180,46 +182,91 @@ def filter_students_by_keyword(students: list, keyword: str) -> list:
         return students
     return [s for s in students if kw in s]
 
-# ====== Quick Reply builders ======
-def weekday_quick_reply():
-    items = [
-        QuickReplyButton(action=MessageAction(label="今天", text="上課日:今天")),
-        QuickReplyButton(action=MessageAction(label="週一", text="上課日:1")),
-        QuickReplyButton(action=MessageAction(label="週二", text="上課日:2")),
-        QuickReplyButton(action=MessageAction(label="週三", text="上課日:3")),
-        QuickReplyButton(action=MessageAction(label="週四", text="上課日:4")),
-        QuickReplyButton(action=MessageAction(label="週五", text="上課日:5")),
-        QuickReplyButton(action=MessageAction(label="週六", text="上課日:6")),
-        QuickReplyButton(action=MessageAction(label="週日", text="上課日:7")),
-    ]
-    return QuickReply(items=items[:13])
+# ====== Flex builders (極簡 App 感) ======
+def flex_student_list_card(title: str, students: list, show_search: bool):
+    # students: list of names (already sliced for display)
+    buttons = []
+    for name in students:
+        buttons.append({
+            "type": "button",
+            "height": "sm",
+            "style": "primary",
+            "action": {"type": "message", "label": name, "text": f"選擇學生:{name}"}
+        })
 
-def student_quick_reply(students: list):
-    buttons = [
-        QuickReplyButton(action=MessageAction(label=n, text=f"選擇學生:{n}"))
-        for n in students[:13]
-    ]
-    return QuickReply(items=buttons)
+    if show_search:
+        buttons.append({
+            "type": "button",
+            "height": "sm",
+            "style": "secondary",
+            "action": {"type": "message", "label": "🔍 搜尋", "text": "搜尋學生"}
+        })
 
-def lesson_quick_reply(name: str):
-    lessons = ["0.5", "1", "1.5", "2", "請假"]
-    buttons = [
-        QuickReplyButton(action=MessageAction(label=l, text=f"堂數:{name}:{l}"))
-        for l in lessons
-    ]
-    return QuickReply(items=buttons)
+    contents = {
+        "type": "bubble",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": title, "weight": "bold", "size": "lg"},
+                {"type": "text", "text": "點選學生開始點名", "size": "sm", "color": "#666666"},
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "sm",
+                    "margin": "md",
+                    "contents": buttons if buttons else [
+                        {"type": "text", "text": "（今天沒有綁定學生）", "size": "sm", "color": "#666666"}
+                    ]
+                }
+            ]
+        }
+    }
+    return FlexSendMessage(alt_text="點名-選學生", contents=contents)
+
+def flex_lesson_card(student_name: str):
+    options = ["0.5", "1", "1.5", "2", "請假"]
+    btns = []
+    for opt in options:
+        style = "primary" if opt != "請假" else "secondary"
+        btns.append({
+            "type": "button",
+            "height": "sm",
+            "style": style,
+            "action": {"type": "message", "label": opt, "text": f"堂數:{student_name}:{opt}"}
+        })
+
+    contents = {
+        "type": "bubble",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": student_name, "weight": "bold", "size": "lg"},
+                {"type": "text", "text": "選擇本次堂數", "size": "sm", "color": "#666666"},
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "sm",
+                    "margin": "md",
+                    "contents": btns
+                }
+            ]
+        }
+    }
+    return FlexSendMessage(alt_text="點名-選堂數", contents=contents)
 
 # ====== Webhook ======
 @app.route("/webhook", methods=["POST"])
 def webhook():
     signature = request.headers.get("X-Line-Signature")
     body = request.get_data(as_text=True)
-
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-
     return "OK"
 
 # ====== Rich Menu Postback ======
@@ -229,22 +276,7 @@ def handle_postback(event):
     uid = getattr(event.source, "user_id", None)
 
     if data == "action=attendance":
-        # 權限擋家長（就算誤綁 all 也安全）
-        if not uid or (not is_teacher(uid)):
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="此功能僅限老師使用。若需協助請點「聯絡教室」。")
-            )
-            return
-
-        pending_set(uid, stage="choose_day", weekday=None)
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="請選擇上課日", quick_reply=weekday_quick_reply())
-        )
-        return
-
-    elif data == "action=records":
+        # 權限擋家長
         if not uid or (not is_teacher(uid)):
             line_bot_api.reply_message(
                 event.reply_token,
@@ -252,9 +284,26 @@ def handle_postback(event):
             )
             return
 
-        # 簡易版：抓最近 10 筆，過濾該老師，顯示最近 5 筆
+        wd = weekday_today_1to7()
+        students_all = get_teacher_students_by_weekday(uid, wd)
+
+        # 極簡：顯示前12 + 搜尋
+        show_search = len(students_all) > 12
+        students_show = students_all[:12]
+
+        title = f"今天 {weekday_label(wd)} 點名"
+        line_bot_api.reply_message(
+            event.reply_token,
+            flex_student_list_card(title=title, students=students_show, show_search=show_search)
+        )
+        return
+
+    elif data == "action=records":
+        if not uid or (not is_teacher(uid)):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="此功能僅限老師使用。"))
+            return
+
         rows = ws_log.get_all_values()
-        # header: timestamp, teacher_line_id, student_name, classes, status, remaining_after
         hits = []
         for row in reversed(rows[1:]):
             if len(row) < 6:
@@ -278,19 +327,13 @@ def handle_postback(event):
                     lines.append(f"{ts}  {name}  請假  剩{remain}")
                 else:
                     lines.append(f"{ts}  {name}  -{classes}  剩{remain}")
-            msg = "📒 最近紀錄（最多5筆）\n" + "\n".join(lines)
+            msg = "📒 最近紀錄（5筆）\n" + "\n".join(lines)
 
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=msg)
-        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
     else:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=f"收到操作：{data}")
-        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"收到操作：{data}"))
 
 # ====== Text Handler ======
 @handler.add(MessageEvent, message=TextMessage)
@@ -298,7 +341,7 @@ def handle_message(event):
     text = (event.message.text or "").strip()
     uid = getattr(event.source, "user_id", None)
 
-    # ====== 最高優先：回傳 user_id（用來登記老師/家長） ======
+    # 取得 user_id
     if text in ["老師報到", "ID", "id", "我的ID", "我的 id", "我的Id"]:
         if not uid:
             line_bot_api.reply_message(
@@ -306,7 +349,6 @@ def handle_message(event):
                 TextSendMessage(text="⚠️ 目前拿不到你的 user_id。請用手機 LINE 與官方帳號一對一聊天，再輸入「老師報到」。")
             )
             return
-
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=f"✅ 你的 LINE user_id（teacher_line_id）如下：\n{uid}")
@@ -321,137 +363,55 @@ def handle_message(event):
         )
         return
 
-    # ====== 權限擋：非老師不要進入點名流程 ======
-    #（但保留他們可以用「聯絡教室」等訊息）
-    # 只有在「點名流程」相關文字時才擋，避免影響一般聊天
-    if text.startswith(("上課日:", "選擇學生:", "堂數:", "搜尋:")):
+    # ====== 點名流程相關：非老師全部擋 ======
+    if text.startswith(("選擇學生:", "堂數:", "搜尋", "搜尋:")):
         if not uid or (not is_teacher(uid)):
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="此功能僅限老師使用。若需協助請點「聯絡教室」。")
-            )
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="此功能僅限老師使用。"))
             return
 
-    # ====== 點名流程：選上課日 ======
-    if text.startswith("上課日:"):
-        if not uid:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 目前拿不到你的 user_id。"))
-            return
-
-        st = pending_get(uid)
-        # 沒有 pending 也允許直接選上課日（容錯）
-        raw = text.split(":", 1)[1].strip()
-
-        if raw == "今天":
-            wd = weekday_today_1to7()
-        else:
-            try:
-                wd = int(raw)
-            except ValueError:
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text="⚠️ 上課日格式錯誤，請重新按「點名」。")
-                )
-                return
-
-        if wd < 1 or wd > 7:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="⚠️ weekday 必須是 1~7。")
-            )
-            return
-
-        pending_set(uid, stage="choose_student", weekday=wd)
-        students = get_teacher_students_by_weekday(uid, wd)
-
-        if not students:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=f"{weekday_label(wd)} 沒有綁定學生。\n請到 teacher_students 填 weekday（1~7）。")
-            )
-            return
-
-        # QuickReply 上限 13：若超過，先提示用搜尋縮小（你下一版再擴充 UI）
-        if len(students) > 13:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(
-                    text=f"{weekday_label(wd)} 學生共有 {len(students)} 位，為避免選單太長：\n"
-                         f"請輸入「搜尋:關鍵字」(例如：搜尋:王)，我會列出符合的名單。"
-                )
-            )
-            pending_set(uid, stage="searching", weekday=wd)
-            return
-
+    # ====== 搜尋入口（從 Flex 的 🔍 搜尋 按鈕來） ======
+    if text == "搜尋學生":
+        wd = weekday_today_1to7()
+        pending_set(uid, stage="searching", weekday=wd)
+        # 這裡只發一則短提示（必要訊息）
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text=f"請選擇學生（{weekday_label(wd)}）", quick_reply=student_quick_reply(students))
+            TextSendMessage(text="請輸入：搜尋:關鍵字（例：搜尋:王）")
         )
         return
 
-    # ====== 點名流程：搜尋學生（在某個 weekday 裡） ======
+    # ====== 搜尋指令：搜尋:王 ======
     if text.startswith("搜尋:"):
-        if not uid:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 目前拿不到你的 user_id。"))
-            return
-
         st = pending_get(uid)
-        if not st or st.get("stage") not in ["searching", "choose_student"]:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="請先按「點名」並選上課日。")
-            )
-            return
-
-        wd = st.get("weekday")
-        if not wd:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="⚠️ 目前沒有上課日資訊，請重新按「點名」。")
-            )
-            return
+        wd = st.get("weekday") if st and st.get("stage") == "searching" else weekday_today_1to7()
 
         keyword = text.split(":", 1)[1].strip()
         students_all = get_teacher_students_by_weekday(uid, wd)
-        students = filter_students_by_keyword(students_all, keyword)
+        matches = filter_students_by_keyword(students_all, keyword)
 
-        if not students:
+        if not matches:
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=f"找不到符合「{keyword}」的學生（{weekday_label(wd)}）。\n請換關鍵字再試一次。")
+                TextSendMessage(text=f"找不到符合「{keyword}」的學生（{weekday_label(wd)}）。")
             )
             return
 
-        if len(students) > 13:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=f"符合「{keyword}」的學生仍有 {len(students)} 位，請再輸入更精準的關鍵字（例如兩個字）。")
-            )
-            return
+        show_search = len(matches) > 12
+        matches_show = matches[:12]
+        title = f"{weekday_label(wd)}｜搜尋：{keyword}"
 
-        pending_set(uid, stage="choose_student", weekday=wd)
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text=f"請選擇學生（{weekday_label(wd)}，關鍵字：{keyword}）", quick_reply=student_quick_reply(students))
+            flex_student_list_card(title=title, students=matches_show, show_search=show_search)
         )
         return
 
-    # ====== 選學生 ======
+    # ====== 選學生 → 回堂數 Flex ======
     if text.startswith("選擇學生:"):
         name = text.split(":", 1)[1].strip()
-
-        # 若你希望「必須先選上課日」才可選學生，就開啟這段檢查
-        # st = pending_get(uid) if uid else None
-        # if not st or st.get("stage") not in ["choose_student", "searching"]:
-        #     line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請先按「點名」並選上課日。"))
-        #     return
-
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(
-                text=f"請選擇 {name} 上課堂數",
-                quick_reply=lesson_quick_reply(name)
-            )
+            flex_lesson_card(student_name=name)
         )
         return
 
@@ -461,13 +421,6 @@ def handle_message(event):
             _, name, lesson = text.split(":", 2)
             teacher_id = uid
 
-            if not teacher_id:
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text="⚠️ 目前拿不到你的 user_id。請用手機 LINE 與官方帳號一對一聊天再試。")
-                )
-                return
-
             # 請假（不扣堂，只記錄）
             if lesson == "請假":
                 remaining = get_remaining(name)
@@ -475,7 +428,7 @@ def handle_message(event):
                 pending_clear(teacher_id)
                 line_bot_api.reply_message(
                     event.reply_token,
-                    TextSendMessage(text=f"✅ 已記錄 {name}：請假\n剩餘：{remaining} 堂")
+                    TextSendMessage(text=f"✅ {name} 請假｜剩 {remaining}")
                 )
                 return
 
@@ -486,9 +439,7 @@ def handle_message(event):
             if after < 0:
                 line_bot_api.reply_message(
                     event.reply_token,
-                    TextSendMessage(
-                        text=f"⚠️ {name} 剩餘堂數不足\n目前：{before} 堂\n本次要扣：{used} 堂"
-                    )
+                    TextSendMessage(text=f"⚠️ {name} 剩餘不足（現有 {before}，本次扣 {used}）")
                 )
                 return
 
@@ -496,24 +447,18 @@ def handle_message(event):
             append_log(teacher_id, name, lesson, "上課", after)
             pending_clear(teacher_id)
 
+            # 極簡結果
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(
-                    text=f"✅ 已為 {name} 記錄 {lesson} 堂\n"
-                         f"時間：{now_taipei_str()}\n"
-                         f"剩餘：{after} 堂"
-                )
+                TextSendMessage(text=f"✅ {name} -{lesson}｜剩 {after}")
             )
             return
 
         except Exception as e:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=f"⚠️ 扣堂失敗：{e}")
-            )
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"⚠️ 扣堂失敗：{e}"))
             return
 
-    # ====== 其他 ======
+    # 其他
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text="請使用下方選單（點名 / 紀錄 / 聯絡教室）")
