@@ -187,7 +187,7 @@ def enc(s: str) -> str:
 def dec(s: str) -> str:
     return unquote(s)
 
-# ====== Flex builders (全部 postback，不刷聊天室文字指令) ======
+# ====== Flex builders (點名流程：全部 postback) ======
 def flex_weekday_picker_card(today_wd: int):
     btns = [{
         "type": "button", "height": "sm", "style": "primary",
@@ -311,6 +311,134 @@ def flex_done_card(wd: int, msg: str):
         }
     )
 
+# ====== 紀錄：近兩週 20 筆 / 可翻頁（每頁 20，拆 4 bubble，每 bubble 5 筆） ======
+def get_records_last_14_days(uid: str) -> list:
+    rows = ws_log.get_all_values()
+    if len(rows) <= 1:
+        return []
+
+    now = datetime.now(TZ_TAIPEI)
+    start = now - timedelta(days=14)
+
+    hits = []
+    for r in reversed(rows[1:]):  # 最新到最舊
+        if len(r) < 6:
+            continue
+        if (r[1] or "").strip() != uid:
+            continue
+
+        ts_str = (r[0] or "").strip()
+        try:
+            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ_TAIPEI)
+        except:
+            continue
+
+        if dt < start:
+            break
+
+        hits.append(r)
+
+    return hits  # 最新在前
+
+def _record_item_box(r):
+    ts = (r[0] or "").strip()
+    name = (r[2] or "").strip()
+    classes = (r[3] or "").strip()
+    status = (r[4] or "").strip()
+    remain = (r[5] or "").strip()
+
+    if status == "請假":
+        line_text = f"{name}｜請假｜剩 {remain}"
+        color = "#999999"
+    else:
+        line_text = f"{name}｜-{classes}｜剩 {remain}"
+        color = "#1A73E8"
+
+    return {
+        "type": "box",
+        "layout": "vertical",
+        "spacing": "xs",
+        "contents": [
+            {"type": "text", "text": ts, "size": "xs", "color": "#888888"},
+            {"type": "text", "text": line_text, "size": "sm", "color": color, "wrap": True},
+            {"type": "separator", "margin": "sm"}
+        ]
+    }
+
+def flex_records_last_14_days_paged(uid: str, page: int = 0, page_size: int = 20):
+    all_hits = get_records_last_14_days(uid)
+    total = len(all_hits)
+
+    if total == 0:
+        return FlexSendMessage(
+            alt_text="近兩週紀錄",
+            contents={
+                "type": "bubble",
+                "body": {"type": "box", "layout": "vertical", "contents": [
+                    {"type": "text", "text": "📒 近兩週紀錄", "weight": "bold", "size": "lg"},
+                    {"type": "text", "text": "（沒有資料）", "margin": "md", "color": "#888888"}
+                ]}
+            }
+        )
+
+    max_page = (total - 1) // page_size
+    page = max(0, min(page, max_page))
+
+    start_idx = page * page_size
+    end_idx = min(start_idx + page_size, total)
+    page_hits = all_hits[start_idx:end_idx]
+
+    # 20 筆分 4 bubble：每 bubble 5 筆
+    chunk_size = 5
+    bubbles = []
+    for bi in range(0, len(page_hits), chunk_size):
+        chunk = page_hits[bi:bi + chunk_size]
+        body_contents = []
+
+        # 第一張 bubble 放標題/摘要
+        if bi == 0:
+            body_contents.extend([
+                {"type": "text", "text": "📒 近兩週紀錄", "weight": "bold", "size": "lg"},
+                {"type": "text", "text": f"第 {page+1}/{max_page+1} 頁｜顯示 {start_idx+1}-{end_idx} / {total}",
+                 "size": "xs", "color": "#888888", "margin": "sm"},
+                {"type": "separator", "margin": "md"},
+            ])
+
+        for r in chunk:
+            body_contents.append(_record_item_box(r))
+
+        bubble = {
+            "type": "bubble",
+            "size": "mega",
+            "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body_contents}
+        }
+        bubbles.append(bubble)
+
+    # 最後一張 bubble 加 footer 翻頁
+    footer_btns = []
+    if page > 0:
+        footer_btns.append({
+            "type": "button",
+            "height": "sm",
+            "style": "secondary",
+            "action": {"type": "postback", "label": "⬅ 上一頁", "data": f"cmd=records_page&page={page-1}"}
+        })
+    if page < max_page:
+        footer_btns.append({
+            "type": "button",
+            "height": "sm",
+            "style": "primary",
+            "action": {"type": "postback", "label": "下一頁 ➡", "data": f"cmd=records_page&page={page+1}"}
+        })
+    if footer_btns:
+        bubbles[-1]["footer"] = {"type": "box", "layout": "horizontal", "spacing": "sm", "contents": footer_btns}
+
+    # carousel 最多 10 bubbles；我們每頁最多 4 bubbles，安全
+    return FlexSendMessage(
+        alt_text="近兩週紀錄",
+        contents={"type": "carousel", "contents": bubbles}
+    )
+
 # ====== Webhook ======
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -339,40 +467,12 @@ def handle_postback(event):
         reply(flex_weekday_picker_card(weekday_today_1to7()))
         return
 
-    # Rich Menu：紀錄
+    # Rich Menu：紀錄（美觀 Flex + 近兩週 + 翻頁）
     if data == "action=records":
         if not uid or not is_teacher(uid):
             reply(TextSendMessage(text="此功能僅限老師使用。"))
             return
-
-        # 最近 5 筆（該老師）
-        rows = ws_log.get_all_values()
-        hits = []
-        for row in reversed(rows[1:]):
-            if len(row) < 6:
-                continue
-            if (row[1] or "").strip() == uid:
-                hits.append(row)
-            if len(hits) >= 5:
-                break
-
-        if not hits:
-            reply(TextSendMessage(text="📒 目前沒有紀錄。"))
-            return
-
-        lines = []
-        for r in hits:
-            ts = (r[0] or "").strip()
-            name = (r[2] or "").strip()
-            classes = (r[3] or "").strip()
-            status = (r[4] or "").strip()
-            remain = (r[5] or "").strip()
-            if status == "請假":
-                lines.append(f"{ts}  {name}  請假  剩{remain}")
-            else:
-                lines.append(f"{ts}  {name}  -{classes}  剩{remain}")
-
-        reply(TextSendMessage(text="📒 最近紀錄（5筆）\n" + "\n".join(lines)))
+        reply(flex_records_last_14_days_paged(uid, page=0, page_size=20))
         return
 
     # 其他 postback：全部限定老師
@@ -382,6 +482,15 @@ def handle_postback(event):
 
     qs = parse_qs(data)
     cmd = qs.get("cmd", "")
+
+    # 紀錄翻頁
+    if cmd == "records_page":
+        try:
+            page = int(qs.get("page", "0"))
+        except:
+            page = 0
+        reply(flex_records_last_14_days_paged(uid, page=page, page_size=20))
+        return
 
     if cmd == "back_to_day":
         reply(flex_weekday_picker_card(weekday_today_1to7()))
@@ -457,12 +566,13 @@ def handle_postback(event):
 
     reply(TextSendMessage(text=f"收到操作：{data}"))
 
-# ====== Message handler（只保留 ID / 搜尋 / 其他提示） ======
+# ====== Message handler（工具型：只處理 ID / 搜尋，其餘全部靜默） ======
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = (event.message.text or "").strip()
     uid = getattr(event.source, "user_id", None)
 
+    # 只做 ID 查詢（不限制老師，方便你拿家長/老師/自己ID）
     if text in ["老師報到", "ID", "id", "我的ID", "我的 id", "我的Id"]:
         if not uid:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 目前拿不到你的 user_id。"))
@@ -470,9 +580,10 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 你的 user_id：{uid}"))
         return
 
+    # 搜尋只開放老師（因為會回學生清單）
     if text.startswith("搜尋:"):
         if not uid or not is_teacher(uid):
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="此功能僅限老師使用。"))
+            # 靜默（避免干擾一般聊天/家長訊息）
             return
 
         st = state_get(uid)
@@ -483,13 +594,15 @@ def handle_message(event):
         matches = filter_students_by_keyword(students, keyword)
 
         if not matches:
+            # 這裡仍回一次，避免老師以為沒收到
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"找不到符合「{keyword}」的學生（{weekday_label(wd)}）。"))
             return
 
         line_bot_api.reply_message(event.reply_token, flex_student_list_card(wd, matches, keyword=keyword))
         return
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請使用選單（點名 / 紀錄）"))
+    # 其他文字一律靜默（避免群組/家長/老師一般聊天被機器人干擾）
+    return
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
